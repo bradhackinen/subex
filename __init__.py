@@ -9,7 +9,6 @@ from torch.nn.utils.rnn import PackedSequence
 from torchUtilities import *
 from scipy.ndimage.measurements import label, find_objects
 from ast import literal_eval
-
 import seaborn as sb
 import matplotlib.pyplot as plt
 
@@ -102,9 +101,6 @@ def generateMinibatches(trainingDataDF,size=10,cuda=False,max_len=200,shuffle=Tr
         yield packedChars,packedLabels
 
 
-# minibatchDF['chars'].apply(len).sum()
-# packedChars.batch_sizes.sum()
-
 class charClassifier(nn.Module):
     def __init__(self,d_in=96,d_out=1,d_hidden=100,layers=3,bidirectional=True):
         super().__init__()
@@ -179,11 +175,8 @@ def trainMinibatch(batchData,modelPackage):
 
 
 def trainModel(modelPackage,trainingStringsDF,testStringsDF=None,save_as=None,minibatch_size=10,epochs=10,exit_function=None,cuda=False,verbose=False):
-
     trainingDataDF = buildTrainingData(trainingStringsDF)
 
-    # epochBatchIterator = (generateMinibatches(trainingDataDF,cuda=True,size=minibatch_size) for epoch in range(epochs))
-    # modelPackage['loss_history'] = trainWithHistory(lambda b: trainMinibatch(b,modelPackage),epochBatchIterator,modelPackage['loss_history'],exit_function=exit_function,verbose=verbose)
     cuda = next(modelPackage['model'].parameters()).is_cuda
 
     try:
@@ -211,14 +204,13 @@ def trainModel(modelPackage,trainingStringsDF,testStringsDF=None,save_as=None,mi
     return modelPackage['loss_history']
 
 
-
 def matchesFromProbs(chars,probs,threshold=0.5):
     labels,n = label(probs > threshold)
     matches = [chars[span[0]].decode('ascii') for span in find_objects(labels)]
     return matches
 
 
-def findMatches(strings,modelPackage,batch_size=50,return_probs=False):
+def extract(strings,modelPackage,batch_size=50,return_char_scores=False,dropout_samples=0):
     resultsDF = pd.DataFrame(list(strings),columns=['string'])
 
     uniqueDF = resultsDF.drop_duplicates()
@@ -226,17 +218,18 @@ def findMatches(strings,modelPackage,batch_size=50,return_probs=False):
     uniqueDF['len'] = [len(c) for c in uniqueDF['chars']]
     uniqueDF = uniqueDF[uniqueDF['len']>0]
 
-    modelPackage['model'].eval()
     batchResults = []
     for batchDF in dfChunks(uniqueDF,batch_size):
         batchDF = batchDF.sort_values('len',ascending=False)
-
 
         with torch.no_grad():
             packedChars,_ = bytesToPacked1Hot(list(batchDF['chars']),clamp_range=(31,126),presorted=True)
 
             if next(modelPackage['model'].parameters()).is_cuda:
                 packedChars = packedToCuda(packedChars)
+
+            # Compute point estimates (no dropout)
+            modelPackage['model'].eval()
 
             packedOutput = modelPackage['model'](packedChars)
 
@@ -246,16 +239,35 @@ def findMatches(strings,modelPackage,batch_size=50,return_probs=False):
             packedEntropies = PackedSequence(F.binary_cross_entropy_with_logits(packedOutput.data,packedProbs.data,reduce=False),packedOutput.batch_sizes)
             paddedEntropies,lengths = torch.nn.utils.rnn.pad_packed_sequence(packedEntropies)
 
-        batchDF['probs'] = [x[:l].cpu().numpy().ravel() for x,l in zip(paddedProbs.t(),lengths)]
-        # batchDF['entropies'] = [x[:l].cpu().numpy() for x,l in zip(paddedEntropies.t(),lengths)]
-        batchDF['entropy'] = [x[:l].cpu().numpy().sum() for x,l in zip(paddedEntropies.t(),lengths)]
+            batchDF['probs'] = [x[:l].ravel() for x,l in zip(paddedProbs.t().cpu().numpy(),lengths)]
+            # batchDF['entropies'] = [x[:l].cpu().numpy() for x,l in zip(paddedEntropies.t(),lengths)]
+            batchDF['entropy'] = [x[:l].sum() for x,l in zip(paddedEntropies.t().cpu().numpy(),lengths)]
 
-        batchDF['matches'] = [tuple(matchesFromProbs(c,p)) for i,c,p in batchDF[['chars','probs']].itertuples()]
+            batchDF['matches'] = [tuple(matchesFromProbs(c,p)) for i,c,p in batchDF[['chars','probs']].itertuples()]
 
-        if return_probs:
-            batchDF = batchDF[['string','chars','matches','entropy','probs']]
-        else:
-            batchDF = batchDF[['string','chars','matches','entropy']]
+            # Estimate uncertainty using dropout samples (if dropout samples > 0)
+            if dropout_samples:
+
+                samples = [paddedProbs] #Use point estimates as first sample
+                for i in range(dropout_samples):
+                    modelPackage['model'].train()
+
+                    packedOutput = modelPackage['model'](packedChars)
+
+                    packedProbs = PackedSequence(F.sigmoid(packedOutput.data),packedOutput.batch_sizes)
+                    paddedProbs,lengths = torch.nn.utils.rnn.pad_packed_sequence(packedProbs)
+
+                    samples.append(paddedProbs)
+
+                stds = torch.cat(samples,dim=2).std(dim=2)
+
+                if return_char_scores:
+                    batchDF['dropout_sds'] = [x[:l].ravel() for x,l in zip(stds.t().cpu().numpy(),lengths)]
+
+                batchDF['dropout_sd'] = stds.sum(dim=0).cpu().numpy()
+
+        if not return_char_scores:
+            batchDF = batchDF.drop(['probs'],axis=1)
 
         batchResults.append(batchDF)
 
@@ -265,29 +277,51 @@ def findMatches(strings,modelPackage,batch_size=50,return_probs=False):
     return resultsDF
 
 
-def charProbArray(chars,probs,max_len=1000):
-    width = min(max(len(p) for p in probs),max_len)
-    probArray = np.zeros((len(probs),width))
-    for i,p in enumerate(probs):
+def charScoreArray(chars,scores,max_len=1000):
+    width = min(max(len(p) for p in scores),max_len)
+    scoreArray = np.zeros((len(scores),width))
+    for i,p in enumerate(scores):
         p = p[:width]
-        probArray[i,:len(p)] = p
+        scoreArray[i,:len(p)] = p
 
     charArray = np.vstack([np.array(list(c.decode('ascii')[:width])+['']*(width - len(c))) for c in chars])
-    return charArray,probArray
+    return charArray,scoreArray
 
 
-def plotCharProbs(chars,probs,max_len=1000,n_colors=4,gamma=1.5):
-    charArray,probArray = charProbArray(chars,probs,max_len)
+def transparent_cmap(cmap, N=255):
+    '''Copy colormap and set alpha values
+    from https://stackoverflow.com/questions/42481203/heatmap-on-top-of-image'''
+
+    mycmap = cmap
+    mycmap._init()
+    mycmap._lut[:,-1] = np.linspace(0, 0.8, N+4)
+    return mycmap
+
+
+
+def plotCharProbs(chars,probs,uncertainties=None,max_len=1000,n_colors=4,gamma=1.5):
+    charArray,probArray = charScoreArray(chars,probs,max_len)
 
     plt.figure(figsize=(0.1*charArray.shape[1],0.23*len(chars)))
-    palette = sb.cubehelix_palette(light=1,dark=0.6,hue=1,start=1,rot=1,n_colors=n_colors,gamma=gamma)
+
+    palette = sb.cubehelix_palette(light=1,dark=0.6,hue=1,start=1,rot=1,n_colors=2,gamma=gamma)
     sb.heatmap(probArray,annot=charArray,cmap=palette,fmt='',xticklabels=False,yticklabels=False,annot_kws={'family':'monospace'},cbar=False)
 
+    if uncertainties is not None:
+        palette = sb.cubehelix_palette(light=1,dark=0.6,hue=2,start=1,rot=1,n_colors=2,gamma=gamma)
+        sb.heatmap(probArray,annot=charArray,cmap=palette,fmt='',xticklabels=False,yticklabels=False,annot_kws={'family':'monospace'},cbar=False)
 
+        charArray,uncertaintyArray = charScoreArray(chars,uncertainties,max_len)
+        cmap = sb.cubehelix_palette(light=1,dark=0.6,hue=3,start=0.7,rot=0,gamma=gamma,as_cmap=True)
+        cmap = transparent_cmap(cmap)
+        sb.heatmap(uncertaintyArray,cmap=cmap,fmt='',xticklabels=False,yticklabels=False,annot_kws={'family':'monospace'},cbar=False)
+    else:
+        palette = sb.cubehelix_palette(light=1,dark=0.6,hue=2,start=1,rot=1,n_colors=n_colors,gamma=gamma)
+        sb.heatmap(probArray,annot=charArray,cmap=palette,fmt='',xticklabels=False,yticklabels=False,annot_kws={'family':'monospace'},cbar=False)
 
 
 def scoreTestStringsDF(testStringsDF,modelPackage):
-    matchesDF = findMatches(testStringsDF['string'],modelPackage,return_probs=True)#,hash_function=hash_function)
+    matchesDF = extract(testStringsDF['string'],modelPackage,return_char_scores=True)#,hash_function=hash_function)
 
     testDataDF = buildTrainingData(testStringsDF,max_len=1000000)
 
@@ -314,17 +348,17 @@ if __name__ == '__main__':
 
     # Test code----------------------------------------------------------------------
 
-    trainingStringsDF = loadTrainingStrings(r'C:\Users\Brad\Google Drive\Research\Python3\subex\trainingData\regDotGovCommenterOrgTrainingSet.csv')
+    trainingStringsDF = loadTrainingStrings(r'C:\Users\Brad\Google Drive\Research\regcomments\data\orgs\extraction\trainingData\regDotGovCommenterOrg_train.csv',encoding='utf8')
+    testStringsDF = loadTrainingStrings(r'C:\Users\Brad\Google Drive\Research\regcomments\data\orgs\extraction\trainingData\regDotGovCommenterOrg_test.csv',encoding='mbcs')
 
-
-    testStringsDF = trainingStringsDF.sample(frac=0.05)
-    trainingStringsDF = trainingStringsDF[~trainingStringsDF.index.get_level_values(0).isin(testStringsDF.index.get_level_values(0))]
+    trainingStringsDF = trainingStringsDF.sample(100)
 
     #Initialize org extractor
     modelPackage = newModel(d=100,cuda=True,lr=1e-3)
 
     #Train model
-    historyDF = trainModel(modelPackage,trainingStringsDF,testStringsDF=testStringsDF,epochs=3,minibatch_size=20,verbose=True)
+    historyDF = trainModel(modelPackage,trainingStringsDF,testStringsDF=testStringsDF,epochs=10,minibatch_size=20,verbose=True)
+    historyDF = trainModel(modelPackage,trainingStringsDF,epochs=10,minibatch_size=20,verbose=True)
     plotLossHistory(historyDF)
 
     saveModelPackage(modelPackage,r'C:\Users\Brad\Google Drive\Research\Python3\subex\trainedModels\test.bin')
@@ -333,8 +367,7 @@ if __name__ == '__main__':
     historyDF = trainModel(loadedModelPackage,trainingStringsDF,epochs=3,minibatch_size=(5,20),verbose=True)
     plotLossHistory(historyDF)
 
-    loadedModelPackage['loss_history']
-
-    resultsDF = findMatches(trainingStringsDF['string'],loadedModelPackage,return_probs=True)
+    resultsDF = extract(trainingStringsDF['string'].sample(10),modelPackage,return_char_scores=True,dropout_samples=3)
 
     plotCharProbs(resultsDF['chars'],resultsDF['probs'])
+    plotCharProbs(resultsDF['chars'],resultsDF['probs'],resultsDF['dropout_sds'])
